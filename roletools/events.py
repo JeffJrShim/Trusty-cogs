@@ -1,17 +1,30 @@
 import asyncio
-import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Union
 
 import discord
+from red_commons.logging import getLogger
 from redbot.core import bank, commands
 from redbot.core.i18n import Translator
 
 from .abc import RoleToolsMixin
 
-log = logging.getLogger("red.Trusty-cogs.RoleTools")
+log = getLogger("red.Trusty-cogs.RoleTools")
 
 _ = Translator("Roletools", __file__)
+
+
+class RoleChangeResponse:
+    def __init__(self, role: Optional[discord.Role], reason: str, success: bool):
+        self.role = role
+        self.reason = reason
+        self.success = success
+
+    def __bool__(self) -> bool:
+        return self.success
+
+    def __repr__(self):
+        return f"<RoleAssignmentResponse {self.role=} {self.success=} {self.reason=}>"
 
 
 class RoleToolsEvents(RoleToolsMixin):
@@ -46,11 +59,11 @@ class RoleToolsEvents(RoleToolsMixin):
             if member.bot:
                 return
             if await self.check_guild_verification(member, guild):
-                log.debug("Ignoring user due to verification check.")
+                log.debug("Ignoring user (%s) due to verification check.", member.id)
                 return
             if getattr(member, "pending", False):
                 return
-            log.debug(f"Adding role to {member.name} in {member.guild}")
+            log.debug("Adding role to %s in %s", member.name, member.guild)
             await self.give_roles(member, [role], _("Reaction Role"))
 
     @commands.Cog.listener()
@@ -80,7 +93,7 @@ class RoleToolsEvents(RoleToolsMixin):
                 return
             if member.bot:
                 return
-            log.debug(f"Removing role from {member.name} in {member.guild}")
+            log.debug("Removing role from %s in %s", member.name, member.guild)
             await self.remove_roles(member, [role], _("Reaction Role"))
 
     @commands.Cog.listener()
@@ -127,23 +140,25 @@ class RoleToolsEvents(RoleToolsMixin):
     ) -> Union[bool, int]:
         if member.roles:
             return False
-        allowed_discord = datetime.utcnow() - member.created_at
+        allowed_discord = datetime.now(timezone.utc) - member.created_at
         # since discords check for verification level 2 is actually discord age not join age
         allowed_server = (
-            (datetime.utcnow() - member.joined_at) if member.joined_at else timedelta(minutes=10)
+            (datetime.now(timezone.utc) - member.joined_at)
+            if member.joined_at
+            else timedelta(minutes=10)
         )
         if guild.verification_level.value >= 2 and allowed_discord <= timedelta(minutes=5):
-            log.debug(f"Waiting 5 minutes for {member.name} in {guild}")
+            log.debug("Waiting 5 minutes for %s in %s", member.name, guild)
             return 300 - int(allowed_discord.total_seconds())
         elif guild.verification_level.value >= 3 and allowed_server <= timedelta(minutes=10):
-            log.debug(f"Waiting 10 minutes for {member.name} in {guild}")
+            log.debug("Waiting 10 minutes for %s in %s", member.name, guild)
             return 600 - int(allowed_server.total_seconds())
         return False
 
     async def wait_for_verification(self, member: discord.Member, guild: discord.Guild) -> None:
         wait = await self.check_guild_verification(member, guild)
         if wait:
-            log.debug(f"Waiting {wait} seconds before allowing the user to have a role")
+            log.debug("Waiting %s seconds before allowing the user to have a role", wait)
             await asyncio.sleep(int(wait))
 
     async def check_atomicity(self, guild: discord.Guild) -> bool:
@@ -193,7 +208,7 @@ class RoleToolsEvents(RoleToolsMixin):
         check_inclusive: bool = True,
         check_cost: bool = True,
         atomic: Optional[bool] = None,
-    ) -> None:
+    ) -> List[RoleChangeResponse]:
         """
         Handles all the logic for applying roles to a user
 
@@ -227,11 +242,22 @@ class RoleToolsEvents(RoleToolsMixin):
                 will force use of this to reduce API calls on potentially
                 large numbers of members getting roles
         """
+        ret = []
         if not member.guild.get_member(member.id):
-            return
+            ret.append(
+                RoleChangeResponse(
+                    None, _("A request was made for a user that is not part of the guild."), False
+                )
+            )
+            return ret
         guild = member.guild
         if not guild.me.guild_permissions.manage_roles:
-            return
+            ret.append(
+                RoleChangeResponse(
+                    None, _("The bot does not have manage roles permission."), False
+                )
+            )
+            return ret
         if atomic is None:
             atomic = await self.check_atomicity(guild)
         if atomic:
@@ -243,39 +269,91 @@ class RoleToolsEvents(RoleToolsMixin):
 
         for role in roles:
             if role is None or role >= guild.me.top_role:
+                if role is not None:
+                    ret.append(
+                        RoleChangeResponse(
+                            role,
+                            _("The role requested is higher than the bots highest role."),
+                            False,
+                        )
+                    )
+                else:
+                    ret.append(
+                        RoleChangeResponse(role, _("The Role requested no longer exists."), False)
+                    )
                 continue
             if role in to_add and not atomic:
+                ret.append(
+                    RoleChangeResponse(
+                        role,
+                        _("You already have the requested role."),
+                        False,
+                    )
+                )
                 continue
+            require_any = await self.config.role(role).require_any()
             if (required := await self.config.role(role).required()) and check_required:
-                has_required = True
-                for role_id in required:
-                    r = guild.get_role(role_id)
-                    if r is None:
-                        async with self.config.role(role).required() as required_roles:
-                            required_roles.remove(role_id)
+                if require_any:
+                    has_required = False
+                    for r in member.roles:
+                        if r.id in required:
+                            has_required = True
+                    if not has_required:
+                        ret.append(
+                            RoleChangeResponse(
+                                role,
+                                _("You do not have any of the required roles."),
+                                False,
+                            )
+                        )
                         continue
-                    if r not in member.roles:
-                        has_required = False
-                if not has_required:
-                    continue
+                else:
+                    has_required = True
+                    for role_id in required:
+                        r = guild.get_role(role_id)
+                        if r is None:
+                            async with self.config.role(role).required() as required_roles:
+                                required_roles.remove(role_id)
+                            continue
+                        if r not in member.roles:
+                            has_required = False
+                    if not has_required:
+                        ret.append(
+                            RoleChangeResponse(
+                                role, _("You do not have all of the required roles."), False
+                            )
+                        )
+                        continue
             if (cost := await self.config.role(role).cost()) and check_cost:
+                currency_name = await bank.get_currency_name(guild)
+                msg = _(
+                    "You do not have enough {currency_name} to acquire "
+                    "this role. You need {cost} {currency_name}."
+                ).format(currency_name=currency_name, cost=cost)
                 if await bank.can_spend(member, cost):
                     try:
                         await bank.withdraw_credits(member, cost)
                     except Exception:
                         log.info(
-                            f"Could not assign {role} to {member} as they don't have enough credits."
+                            "Could not assign %s to %s as they don't have enough credits.",
+                            role,
+                            member,
                         )
+                        ret.append(RoleChangeResponse(role, msg, False))
                         continue
                 else:
                     log.info(
-                        f"Could not assign {role} to {member} as they don't have enough credits."
+                        "Could not assign %s to %s as they don't have enough credits.",
+                        role,
+                        member,
                     )
+
+                    ret.append(RoleChangeResponse(role, msg, False))
                     continue
             if (inclusive := await self.config.role(role).inclusive_with()) and check_inclusive:
                 inclusive_roles = []
                 for role_id in inclusive:
-                    log.debug(role_id)
+                    log.verbose("role_id: %s", role_id)
                     r = guild.get_role(role_id)
                     if r is None:
                         async with self.config.role(role).inclusive_with() as inclusive_with:
@@ -319,10 +397,14 @@ class RoleToolsEvents(RoleToolsMixin):
                 if atomic:
                     await member.remove_roles(*exclusive_roles, reason=_("Exclusive Roles"))
             to_add.add(role)
+        log.debug("Adding %s to %s", to_add, member.name)
         if atomic:
+            log.verbose("Atomic is true")
             await member.add_roles(*list(to_add), reason=reason)
         else:
+            log.verbose("Atomic is false")
             await member.edit(roles=list(to_add), reason=reason)
+        return ret
 
     async def remove_roles(
         self,
@@ -332,7 +414,7 @@ class RoleToolsEvents(RoleToolsMixin):
         *,
         check_inclusive: bool = True,
         atomic: Optional[bool] = None,
-    ) -> None:
+    ) -> List[RoleChangeResponse]:
         """
         Handles all the logic for removing roles from a user
 
@@ -357,6 +439,7 @@ class RoleToolsEvents(RoleToolsMixin):
                 will force use of this to reduce API calls on potentially
                 large numbers of members getting roles
         """
+        ret = []
         if not member.guild.get_member(member.id):
             return
         guild = member.guild
@@ -371,9 +454,29 @@ class RoleToolsEvents(RoleToolsMixin):
             to_rem = set(member.roles)
 
         for role in roles:
-            if role is None or role.position >= guild.me.top_role.position:
+            if role is None or role >= guild.me.top_role:
+                if role is not None:
+                    ret.append(
+                        RoleChangeResponse(
+                            role,
+                            _("The role requested is higher than the bots highest role."),
+                            False,
+                        )
+                    )
+                else:
+                    ret.append(
+                        RoleChangeResponse(role, _("The Role requested no longer exists."), False)
+                    )
+
                 continue
             if role not in to_rem and not atomic:
+                ret.append(
+                    RoleChangeResponse(
+                        role,
+                        _("You do not have the requested role."),
+                        False,
+                    )
+                )
                 continue
             if (inclusive := await self.config.role(role).inclusive_with()) and check_inclusive:
                 for role_id in inclusive:
@@ -389,11 +492,12 @@ class RoleToolsEvents(RoleToolsMixin):
                 to_rem.add(role)
             else:
                 to_rem.remove(role)
-        log.debug(f"{to_rem}")
+        log.verbose("remove_roles  to_rem: %s", to_rem)
         if atomic:
             await member.remove_roles(*list(to_rem), reason=reason)
         else:
             await member.edit(roles=list(to_rem), reason=reason)
+        return ret
 
     async def _auto_give(self, member: discord.Member) -> None:
         guild = member.guild

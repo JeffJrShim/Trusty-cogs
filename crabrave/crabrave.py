@@ -5,8 +5,10 @@ import os
 
 import aiohttp
 import discord
-import youtube_dl
+import moviepy
+import yt_dlp as youtube_dl
 from moviepy.editor import CompositeVideoClip, TextClip, VideoFileClip
+from red_commons.logging import getLogger
 from redbot.core import checks, commands
 from redbot.core.data_manager import cog_data_path
 
@@ -18,7 +20,7 @@ CRAB_LINK = "https://youtu.be/gDLE3LikgUs"
 MIKU_LINK = "https://youtu.be/qeJjQGF6gz4"
 
 FONT_FILE = "https://github.com/matomo-org/travis-scripts/raw/master/fonts/Verdana.ttf"
-log = logging.getLogger("red.trusty-cogs.crabrave")
+log = getLogger("red.trusty-cogs.crabrave")
 
 
 class CrabRave(commands.Cog):
@@ -27,7 +29,7 @@ class CrabRave(commands.Cog):
     """
 
     __author__ = ["DankMemer Team", "TrustyJAID", "thisisjvgrace"]
-    __version__ = "1.1.2"
+    __version__ = "1.1.3"
 
     def __init__(self, bot):
         self.bot = bot
@@ -37,7 +39,12 @@ class CrabRave(commands.Cog):
         Thanks Sinbad!
         """
         pre_processed = super().format_help_for_context(ctx)
-        return f"{pre_processed}\n\nCog Version: {self.__version__}"
+        return (
+            f"{pre_processed}\n\n"
+            f"Cog Version: {self.__version__}\n"
+            f"yt-dlp Version: {youtube_dl.version.__version__}\n"
+            f"MoveiPy Version: {moviepy.version.__version__}"
+        )
 
     async def red_delete_data_for_user(self, **kwargs):
         """
@@ -48,13 +55,15 @@ class CrabRave(commands.Cog):
     async def check_video_file(self, link: str, name_template: str) -> bool:
         if not (cog_data_path(self) / name_template).is_file():
             try:
+                loop = asyncio.get_running_loop()
                 task = functools.partial(
                     self.dl_from_youtube, link=link, name_template=name_template
                 )
-                task = self.bot.loop.run_in_executor(None, task)
-                await asyncio.wait_for(task, timeout=60)
+                task = loop.run_in_executor(None, task)
+                return await asyncio.wait_for(task, timeout=60)
             except asyncio.TimeoutError:
                 log.exception("Error downloading the crabrave video")
+                return False
             except Exception:
                 log.error("Error downloading crabrave video template", exc_info=True)
                 return False
@@ -90,7 +99,7 @@ class CrabRave(commands.Cog):
     @commands.cooldown(1, 20, commands.BucketType.guild)
     @commands.max_concurrency(2, commands.BucketType.default)
     @checks.bot_has_permissions(attach_files=True)
-    async def crab(self, ctx: commands.Context, *, text: str) -> None:
+    async def crab(self, ctx: commands.Context, *, text: str):
         """Make crab rave videos
 
         There must be exactly 1 `,` to split the message
@@ -107,7 +116,8 @@ class CrabRave(commands.Cog):
             if (not t[0] and not t[0].strip()) or (not t[1] and not t[1].strip()):
                 return await ctx.send("Cannot render empty text")
             fake_task = functools.partial(self.make_crab, t=t, u_id=ctx.message.id)
-            task = self.bot.loop.run_in_executor(None, fake_task)
+            loop = asyncio.get_running_loop()
+            task = loop.run_in_executor(None, fake_task)
 
             try:
                 await asyncio.wait_for(task, timeout=300)
@@ -195,7 +205,8 @@ class CrabRave(commands.Cog):
             if (not t[0] and not t[0].strip()) or (not t[1] and not t[1].strip()):
                 return await ctx.send("Cannot render empty text")
             fake_task = functools.partial(self.make_miku, t=t, u_id=ctx.message.id)
-            task = self.bot.loop.run_in_executor(None, fake_task)
+            loop = asyncio.get_running_loop()
+            task = loop.run_in_executor(None, fake_task)
 
             try:
                 await asyncio.wait_for(task, timeout=300)
